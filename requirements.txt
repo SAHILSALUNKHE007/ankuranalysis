@@ -3,6 +3,7 @@ flask-cors==4.0.0
 gunicorn==21.2.0
 requests==2.31.0
 python-dotenv==1.0.1
+numpy==1.26.4
 PyPDF2==3.0.1
 python-docx==1.1.0
 pandas==2.2.2
