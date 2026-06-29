@@ -18,6 +18,7 @@ import os
 import re
 import json
 import pickle
+import threading
 
 import requests
 import pandas as pd
@@ -55,8 +56,75 @@ def _find_model():
 
 MODEL_PATH = _find_model()
 
+# In-memory model — retraining updates this without touching disk
+_prophet_model = None
+_model_lock = threading.Lock()
+
+# InfinityFree DB — used for live retraining on Render
+DB_CONFIG = {
+    "host":     os.getenv("DB_HOST",   "sql101.infinityfree.com"),
+    "user":     os.getenv("DB_USER",   "if0_41513499"),
+    "password": os.getenv("DB_PASS",   "ankurvelu2026"),
+    "database": os.getenv("DB_NAME",   "if0_41513499_ankur"),
+    "connect_timeout": 30,
+}
+
+def _load_model_from_file():
+    """Load the bundled .pkl into memory at startup."""
+    global _prophet_model
+    if MODEL_PATH and os.path.exists(MODEL_PATH):
+        with open(MODEL_PATH, "rb") as f:
+            with _model_lock:
+                _prophet_model = pickle.load(f)
+        print("Model loaded from file:", MODEL_PATH)
+    else:
+        print("No .pkl found — will retrain from DB on first /retrain call.")
+
+def _retrain_from_db():
+    """Fetch live donation data from InfinityFree and retrain Prophet in memory."""
+    try:
+        import pymysql
+        conn = pymysql.connect(**DB_CONFIG)
+        df = pd.read_sql(
+            "SELECT DonationDate as ds, Amount as y FROM donar_donations "
+            "WHERE DonationDate IS NOT NULL AND Amount > 0 ORDER BY DonationDate",
+            conn
+        )
+        conn.close()
+
+        if df.empty:
+            return False, "No donation data in DB"
+
+        from prophet import Prophet
+        df["ds"] = pd.to_datetime(df["ds"]).dt.to_period("M").dt.to_timestamp()
+        df["y"]  = df["y"].astype(float)
+        df = df.groupby("ds", as_index=False)["y"].sum()
+
+        model = Prophet(yearly_seasonality=True, weekly_seasonality=False, daily_seasonality=False)
+        model.fit(df)
+
+        global _prophet_model
+        with _model_lock:
+            _prophet_model = model
+
+        print(f"Model retrained on {len(df)} monthly records.")
+        return True, f"Retrained on {len(df)} monthly records"
+
+    except Exception as e:
+        print("Retrain error:", e)
+        return False, str(e)
+
 app = Flask(__name__)
 CORS(app)
+
+# Load bundled model at startup, then kick off a background retrain from live DB
+_load_model_from_file()
+
+def _background_retrain():
+    ok, msg = _retrain_from_db()
+    print("Background retrain:", msg)
+
+threading.Thread(target=_background_retrain, daemon=True).start()
 
 
 # -----------------------------------------------------------------------------
@@ -220,11 +288,11 @@ def analyze_resume():
 
 @app.route("/next-6-months", methods=["GET"])
 def forecast_next_6_months():
-    if MODEL_PATH is None:
-        return jsonify({"error": "Forecast model not found"}), 500
+    with _model_lock:
+        model = _prophet_model
 
-    with open(MODEL_PATH, "rb") as f:
-        model = pickle.load(f)
+    if model is None:
+        return jsonify({"error": "Model not ready yet — retrain in progress"}), 503
 
     future = model.make_future_dataframe(periods=6, freq="M")
     forecast = model.predict(future)
@@ -240,6 +308,17 @@ def forecast_next_6_months():
             "Max_Estimate": round(row["yhat_upper"], 2),
         })
     return jsonify(output)
+
+
+@app.route("/retrain", methods=["GET", "POST"])
+def retrain():
+    """Manually trigger a retrain from live DB. Call this from a cron job."""
+    secret = os.getenv("RETRAIN_SECRET", "")
+    if secret and request.args.get("secret") != secret:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    ok, msg = _retrain_from_db()
+    return jsonify({"success": ok, "message": msg}), (200 if ok else 500)
 
 
 # -----------------------------------------------------------------------------
