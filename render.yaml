@@ -1,0 +1,15 @@
+# Render Blueprint for the Ankur Analysis API.
+# In the Render dashboard, set the OPENROUTER_API_KEY env var (do not hardcode it).
+services:
+  - type: web
+    name: ankur-analysis-api
+    runtime: python
+    rootDir: analysis
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.11.9"
